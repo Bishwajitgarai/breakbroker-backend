@@ -15,7 +15,7 @@ app.state.limiter = rate_limiter
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict in production to your domains
+    allow_origins=["*", "http://localhost/"],  # restrict in production to your domains
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
