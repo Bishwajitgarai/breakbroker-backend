@@ -7,5 +7,6 @@ def import_models():
     # Import all your models here so they register with Base.metadata
     # This import is done once, explicitly called when needed
     from app.models.user import User 
+    from app.models.location import Locality
     # add all models here
 

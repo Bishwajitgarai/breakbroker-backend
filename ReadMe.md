@@ -13,3 +13,9 @@ alembic init alembic
 docker run --name breakbroker-db -e POSTGRES_DB=breakbroker -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -v pgdata:/var/lib/postgresql/data -p 5432:5432 -d postgres:14
 $env:PYTHONPATH = "."
 uvicorn app.main:app --reload
+
+#change add new changes in database
+alembic revision --autogenerate -m "Add Locality table"
+
+#Apply in db
+alembic upgrade head
