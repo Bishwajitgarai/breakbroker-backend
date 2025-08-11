@@ -53,4 +53,5 @@ async def root(request: Request):
 async def startup_event():
     async with async_session() as session:
         get_full_path=os.path.join(os.path.curdir,"app/utils/location_mapper.csv")
-        await load_locations_from_csv(session=session, file_path=get_full_path)
+        cget_full_path=os.path.join(os.path.curdir,"app/utils/cities.csv")
+        await load_locations_from_csv(session=session, mapper_file_path=get_full_path,cities_file_path=cget_full_path)

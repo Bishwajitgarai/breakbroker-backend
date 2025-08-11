@@ -1,13 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException,Query, Body
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
+from sqlalchemy import select, or_, and_,func
 from typing import Optional
 from uuid import UUID
 import uuid
 from app.db.session import get_async_session
-from app.models.location import Country, State, City, Locality
+from app.models.location import Country, State, City, Locality,District
 from app.utils.response import api_response
 from app.utils.query_helper import apply_filters, apply_ordering, paginate,soft_delete
+import math
 
 router = APIRouter(prefix="/locations", tags=["Locations"])
 
@@ -262,3 +263,173 @@ async def delete_city(city_id: uuid.UUID,     session: AsyncSession = Depends(ge
 async def delete_locality(locality_id: uuid.UUID,     session: AsyncSession = Depends(get_async_session)
 ):
     return await soft_delete(session, Locality, locality_id)
+
+
+@router.get("/reverse-geocode")
+async def reverse_geocode(
+    lat: float = Query(..., description="Latitude"),
+    long: float = Query(..., description="Longitude"),
+    session: AsyncSession = Depends(get_async_session)
+):
+    # Calculate squared Euclidean distance to simplify
+    # (For better accuracy, you can use Haversine or PostGIS if installed)
+    distance_expr = (
+        (City.lat - lat) * (City.lat - lat) + (City.lng - long) * (City.lng - long)
+    )
+
+    query = (
+        select(City.id, City.name.label("city_name"), State.name.label("state_name"),State.id.label("state_id"),District.id.label("district_id"))
+        .join(State, City.state_id == State.id)
+        .join(District, City.district_id == District.id)
+        .where(City.is_active == True)
+        .order_by(distance_expr.asc())
+        .limit(1)
+    )
+
+    result = await session.execute(query)
+    city_row = result.first()
+
+    if not city_row:
+        raise HTTPException(status_code=404, detail="No city found")
+
+    return api_response(
+        message="Nearest city found for given coordinates",
+        data={
+            "city_id": city_row.id,
+            "city_name": city_row.city_name,
+            "state_name": city_row.state_name,
+            "state_id": city_row.state_id,
+            "district_id": city_row.district_id,
+        },
+    )
+
+def haversine(lat1, lon1, lat2, lon2):
+    # Returns distance in meters between two lat/lon points
+    R = 6371000  # Earth radius in meters
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+    a = math.sin(delta_phi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(delta_lambda/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c
+
+
+
+from sqlalchemy import func
+
+@router.get("/suggestions")
+async def location_suggestions(
+    query: Optional[str] = Query(None, description="Search term for city, state, district or locality"),
+    page: int = Query(1, ge=1, description="Page number, starts from 1"),
+    limit: int = Query(10, ge=1, le=50, description="Number of results per page"),
+    lat: Optional[float] = Query(None, description="Latitude for distance sorting"),
+    long: Optional[float] = Query(None, description="Longitude for distance sorting"),
+    session: AsyncSession = Depends(get_async_session)
+):
+    # Base query with Locality join added
+    base_query = (
+        select(
+            Locality.id.label("locality_id"),
+            Locality.name.label("locality_name"),
+            City.id.label("city_id"),
+            City.name.label("city_name"),
+            State.id.label("state_id"),
+            State.name.label("state_name"),
+            District.id.label("district_id"),
+            District.name.label("district_name"),
+            City.lat,
+            City.lng,
+        )
+        .join(City, Locality.city_id == City.id)
+        .join(State, City.state_id == State.id)
+        .outerjoin(District, City.district_id == District.id)
+        .where(City.is_active == True,State.is_active==True,Locality.is_active==True,District.is_active==True)
+    )
+
+    if query:
+        ilike_query = f"%{query}%"
+        # Case insensitive matching using upper()
+        base_query = base_query.where(
+            or_(
+                func.upper(City.name).like(func.upper(ilike_query)),
+                func.upper(State.name).like(func.upper(ilike_query)),
+                func.upper(District.name).like(func.upper(ilike_query)),
+                func.upper(Locality.name).like(func.upper(ilike_query)),
+            )
+        )
+
+    # Count total results
+    count_query = select(func.count()).select_from(base_query.subquery())
+    total_result = await session.execute(count_query)
+    total_count = total_result.scalar_one()
+
+    offset_val = (page - 1) * limit
+    paginated_query = base_query.limit(limit).offset(offset_val)
+
+    result = await session.execute(paginated_query)
+    rows = result.all()
+    suggestions = []
+
+    if not rows:
+        return api_response(
+            message="Location suggestions fetched",
+            data={
+                "total": total_count,
+                "page": page,
+                "limit": limit,
+                "suggestions": suggestions,
+            },
+        )
+
+    if lat is not None and long is not None:
+        rows_with_distance = []
+        for r in rows:
+            locality_id, locality_name, city_id, city_name, state_id, state_name, district_id, district_name, city_lat, city_lng = r
+            if city_lat is not None and city_lng is not None:
+                dist = haversine(lat, long, float(city_lat), float(city_lng))
+            else:
+                dist = None
+            rows_with_distance.append((r, dist))
+
+        rows_with_distance.sort(key=lambda x: x[1] if x[1] is not None else float('inf'))
+
+        for row, dist in rows_with_distance:
+            locality_id, locality_name, city_id, city_name, state_id, state_name, district_id, district_name, *_ = row
+            entry = {
+                "locality_id": locality_id,
+                "locality_name": locality_name,
+                "city_id": city_id,
+                "city_name": city_name,
+                "state_id": state_id,
+                "state_name": state_name,
+                "district_id": district_id,
+                "district_name": district_name,
+            }
+            if dist is not None:
+                entry["distance_meters"] = dist
+            suggestions.append(entry)
+    else:
+        suggestions = [
+            {
+                "locality_id": r.locality_id,
+                "locality_name": r.locality_name,
+                "city_id": r.city_id,
+                "city_name": r.city_name,
+                "state_id": r.state_id,
+                "state_name": r.state_name,
+                "district_id": r.district_id,
+                "district_name": r.district_name,
+            }
+            for r in rows
+        ]
+
+    return api_response(
+        message="Location suggestions fetched",
+        data={
+            "total": total_count,
+            "page": page,
+            "limit": limit,
+            "suggestions": suggestions,
+        },
+    )

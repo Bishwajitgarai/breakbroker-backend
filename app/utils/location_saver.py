@@ -15,7 +15,7 @@ BATCH_SIZE = 500  # tweak based on your DB and memory
 async def insert_in_batches(session: AsyncSession, objects, batch_size=BATCH_SIZE):
     """Insert objects in batches to avoid memory/transaction overload."""
     for i in range(0, len(objects), batch_size):
-        batch = objects[i:i + batch_size]
+        batch = objects[i : i + batch_size]
         session.add_all(batch)
         await session.flush()
         logger.info(f"Inserted batch {i // batch_size + 1} with {len(batch)} records.")
@@ -35,37 +35,97 @@ def parse_coord_series(series, coord_type):
         except Exception:
             return None
         return None
+
     return series.apply(fix)
 
 
-async def load_locations_from_csv(file_path: str, session: AsyncSession):
+async def load_locations_from_csv(
+    cities_file_path: str, mapper_file_path: str, session: AsyncSession
+):
     logger.info("Checking if country 'India' exists...")
-    india = await session.scalar(select(Country).where(Country.name == "India"))
-    if india:
-        return "Ok"
-
+    india = await session.scalar(select(Country).where(Country.name == "INDIA"))
     if not india:
         logger.info("Country 'India' not found. Creating new entry...")
-        india = Country(id=uuid.uuid4(), name="India", iso_code="IN")
+        india = Country(id=uuid.uuid4(), name="INDIA", iso_code="IN")
         session.add(india)
         await session.flush()
+    else:
+        logger.info("Country 'India' found.")
 
-    logger.info(f"Reading CSV file: {file_path}")
-    df = pd.read_csv(file_path)
-    logger.info(f"Loaded {len(df)} rows from CSV.")
+    # --- LOAD cities.csv and filter only India rows ---
+    logger.info(f"Reading cities CSV file: {cities_file_path}")
+    cities_df = pd.read_csv(cities_file_path)
 
-    # Fix possible NaN in string columns before string operations
-    for col in ["statename", "district", "divisionname", "officename"]:
-        df[col] = df[col].fillna("").astype(str)
+    # Filter only India rows by country_name (case insensitive)
+    cities_df = cities_df[cities_df["country_name"].str.upper() == "INDIA"].copy()
+    logger.info(f"Filtered {len(cities_df)} rows for country 'India' from cities.csv")
+
+    # Uppercase relevant columns for uniformity
+    cities_df["name"] = cities_df["name"].str.upper()
+    cities_df["state_name"] = cities_df["state_name"].str.upper()
+
+    # Parse lat/lng with your helper
+    cities_df["lat"] = parse_coord_series(cities_df["latitude"], "lat")
+    cities_df["lng"] = parse_coord_series(cities_df["longitude"], "lng")
+
+    # --- LOAD location mapper CSV ---
+    logger.info(f"Reading location mapper CSV file: {mapper_file_path}")
+    mapper_df = pd.read_csv(mapper_file_path)
+
+    # Rename statename to state_name before uppercasing
+    mapper_df.rename(columns={"statename": "state_name"}, inplace=True)
+
+    # Uppercase all relevant string columns for consistency
+    for col in ["state_name", "district", "divisionname", "officename"]:
+        mapper_df[col] = mapper_df[col].fillna("").astype(str).str.upper()
 
     # Clean coordinates
-    df["lat"] = parse_coord_series(df["latitude"], "lat")
-    df["lng"] = parse_coord_series(df["longitude"], "lng")
+    mapper_df["lat"] = parse_coord_series(mapper_df["latitude"], "lat")
+    mapper_df["lng"] = parse_coord_series(mapper_df["longitude"], "lng")
+
+    # --- Prepare city name in mapper_df from divisionname ---
+    mapper_df["city_name"] = (
+        mapper_df["divisionname"].str.replace(" DIVISION", "", regex=False).str.strip()
+    )
+
+    # --- Create city dataframe from mapper_df unique city/state/district with lat/lng mean ---
+    mapper_city_grouped = (
+        mapper_df.groupby(["city_name", "state_name"])
+        .agg(
+            district_name=pd.NamedAgg(
+                column="district", aggfunc=lambda x: x.mode().iat[0] if not x.mode().empty else None
+            ),
+            lat=pd.NamedAgg(column="lat", aggfunc=lambda x: x.dropna().mean()),
+            lng=pd.NamedAgg(column="lng", aggfunc=lambda x: x.dropna().mean()),
+        )
+        .reset_index()
+    )
+
+    # --- Prepare city dataframe from cities.csv (no district) ---
+    cities_for_db = cities_df.rename(
+        columns={"name": "city_name", "state_name": "state_name"}
+    )[["city_name", "state_name", "lat", "lng"]].copy()
+    # No district info in cities.csv, so fill with None for district_name
+    cities_for_db["district_name"] = None
+
+    # --- Combine city dataframes ---
+    combined_cities_df = pd.concat(
+        [
+            cities_for_db,
+            mapper_city_grouped[["city_name", "state_name", "district_name", "lat", "lng"]],
+        ],
+        ignore_index=True,
+    )
+
+    # Drop duplicates based on city_name + state_name + district_name
+    combined_cities_df = combined_cities_df.drop_duplicates(
+        subset=["city_name", "state_name", "district_name"]
+    ).reset_index(drop=True)
 
     # --- Process States ---
     logger.info("Processing unique states...")
-    df["state_name"] = df["statename"].str.strip().str.upper()
-    states_df = df[["state_name"]].drop_duplicates()
+    combined_cities_df["state_name"] = combined_cities_df["state_name"].fillna("").str.strip().str.upper()
+    states_df = combined_cities_df[["state_name"]].drop_duplicates()
     logger.info(f"Found {len(states_df)} unique states.")
 
     state_map = {}
@@ -73,7 +133,7 @@ async def load_locations_from_csv(file_path: str, session: AsyncSession):
     for _, row in states_df.iterrows():
         state_name = row.state_name
         if not state_name:
-            continue  # skip empty names
+            continue  # skip empty
         existing_state = await session.scalar(
             select(State).where(State.name == state_name, State.country_id == india.id)
         )
@@ -85,7 +145,6 @@ async def load_locations_from_csv(file_path: str, session: AsyncSession):
 
     if new_states:
         await insert_in_batches(session, new_states)
-        # After flush, populate state_map for new states
         for state_obj in new_states:
             state_map[state_obj.name] = state_obj.id
 
@@ -93,8 +152,8 @@ async def load_locations_from_csv(file_path: str, session: AsyncSession):
 
     # --- Process Districts ---
     logger.info("Processing unique districts...")
-    df["district_name"] = df["district"].str.strip().str.upper()
-    district_df = df[["district_name", "state_name"]].drop_duplicates()
+    combined_cities_df["district_name"] = combined_cities_df["district_name"].fillna("").str.strip().str.upper()
+    district_df = combined_cities_df[["district_name", "state_name"]].drop_duplicates()
     logger.info(f"Found {len(district_df)} unique districts.")
 
     district_map = {}
@@ -103,11 +162,11 @@ async def load_locations_from_csv(file_path: str, session: AsyncSession):
         district_name = row.district_name
         state_name = row.state_name
         if not district_name or not state_name:
-            continue  # skip invalid
+            continue
         existing_district = await session.scalar(
             select(District).where(
                 District.name == district_name,
-                District.state_id == state_map[state_name]
+                District.state_id == state_map[state_name],
             )
         )
         if existing_district:
@@ -124,55 +183,56 @@ async def load_locations_from_csv(file_path: str, session: AsyncSession):
         await insert_in_batches(session, new_districts)
         for district_obj in new_districts:
             state_name_for_district = next(
-                (k for k, v in state_map.items() if v == district_obj.state_id), None)
+                (k for k, v in state_map.items() if v == district_obj.state_id), None
+            )
             if state_name_for_district:
                 district_map[(district_obj.name, state_name_for_district)] = district_obj.id
 
     logger.info("Districts processed.")
 
-    # --- Process Cities ---
-    logger.info("Processing unique cities with deduplication of lat/lng...")
-    df["city_name"] = df["divisionname"].str.replace(" Division", "").str.strip()
-    city_district_map = df.drop_duplicates(subset=["city_name", "state_name", "district_name"]).set_index(["city_name", "state_name"])["district_name"].to_dict()
-
-    city_grouped = (
-        df.groupby(["city_name", "state_name"])
-        .agg(
-            lat=pd.NamedAgg(column="lat", aggfunc=lambda x: x.dropna().mean()),
-            lng=pd.NamedAgg(column="lng", aggfunc=lambda x: x.dropna().mean()),
-        )
-        .reset_index()
-    )
-
-    logger.info(f"Found {len(city_grouped)} unique cities.")
-
+    # --- Process Cities with lat/lng cache ---
+    logger.info("Processing cities...")
     city_map = {}
     new_cities = []
-    
-    for _, row in city_grouped.iterrows():
+    existing_city_coords_cache = {}
+
+    for _, row in combined_cities_df.iterrows():
         city_name = row.city_name
         state_name = row.state_name
-        district_name = city_district_map.get((city_name, state_name))  # get district_name from map
-        if not city_name or not state_name or not district_name:
+        district_name = row.district_name if pd.notnull(row.district_name) and row.district_name != "" else None
+
+        if not city_name or not state_name:
             continue
+
+        district_id = None
+        if district_name:
+            district_id = district_map.get((district_name, state_name))
+
+        lat = row.lat
+        lng = row.lng
+
         existing_city = await session.scalar(
             select(City).where(
                 City.name == city_name,
                 City.state_id == state_map[state_name],
-                City.district_id == district_map.get((district_name, state_name))
+                City.district_id == district_id,
             )
         )
-        district_id = district_map.get((district_name, state_name))
         if existing_city:
             city_map[(city_name, state_name, district_name)] = existing_city.id
+            existing_city_coords_cache[(city_name, state_name, district_name)] = (existing_city.lat, existing_city.lng)
         else:
+            # Fallback lat/lng from cache if missing
+            if (lat is None or lng is None) and (city_name, state_name, district_name) in existing_city_coords_cache:
+                lat, lng = existing_city_coords_cache[(city_name, state_name, district_name)]
+
             city_obj = City(
                 id=uuid.uuid4(),
                 state_id=state_map[state_name],
-                district_id=district_id,  # assign district_id here
+                district_id=district_id,
                 name=city_name,
-                lat=Decimal(f"{row.lat:.6f}") if row.lat is not None else None,
-                lng=Decimal(f"{row.lng:.6f}") if row.lng is not None else None,
+                lat=Decimal(f"{lat:.6f}") if lat is not None else None,
+                lng=Decimal(f"{lng:.6f}") if lng is not None else None,
             )
             new_cities.append(city_obj)
 
@@ -180,16 +240,21 @@ async def load_locations_from_csv(file_path: str, session: AsyncSession):
         await insert_in_batches(session, new_cities)
         for city_obj in new_cities:
             state_name_for_city = next(
-                (k for k, v in state_map.items() if v == city_obj.state_id), None)
+                (k for k, v in state_map.items() if v == city_obj.state_id), None
+            )
             district_name_for_city = next(
-                (k[0] for k, v in district_map.items() if v == city_obj.district_id), None)
-            if state_name_for_city and district_name_for_city:
+                (k[0] for k, v in district_map.items() if v == city_obj.district_id), None
+            )
+            if state_name_for_city:
                 city_map[(city_obj.name, state_name_for_city, district_name_for_city)] = city_obj.id
+                existing_city_coords_cache[(city_obj.name, state_name_for_city, district_name_for_city)] = (city_obj.lat, city_obj.lng)
 
-    # --- Process Localities ---
+    logger.info("Cities processed.")
+
+    # --- Process Localities from mapper_df ---
     logger.info("Processing localities...")
-    df["locality_name"] = (
-        df["officename"]
+    mapper_df["locality_name"] = (
+        mapper_df["officename"]
         .str.replace(" B.O", "", regex=False)
         .str.replace(" H.O", "", regex=False)
         .str.replace(" S.O", "", regex=False)
@@ -200,18 +265,28 @@ async def load_locations_from_csv(file_path: str, session: AsyncSession):
         .str.upper()
     )
 
-    localities_df = df[
-        ["locality_name", "city_name", "state_name", "district_name", "pincode", "lat", "lng"]
-    ].drop_duplicates()
-    localities_df["pincode"] = localities_df["pincode"].astype(str)
+    localities_df = mapper_df[
+        ["locality_name", "city_name", "state_name", "district", "pincode", "lat", "lng"]
+    ].copy()
+
+    localities_df.rename(
+        columns={"district": "district_name"}, inplace=True
+    )
+    localities_df["pincode"] = localities_df["pincode"].astype(str).str.strip()
 
     locality_objs = []
-    for _, row in localities_df.iterrows():
+    for _, row in localities_df.drop_duplicates().iterrows():
         city_key = (row.city_name, row.state_name, row.district_name)
         city_id = city_map.get(city_key)
         if not city_id:
             logger.warning(f"City not found for locality {row.locality_name}, skipping.")
             continue
+
+        lat = row.lat
+        lng = row.lng
+        # Fallback lat/lng from cached city coords if missing in locality
+        if (lat is None or lng is None) and city_key in existing_city_coords_cache:
+            lat, lng = existing_city_coords_cache[city_key]
 
         locality_objs.append(
             Locality(
@@ -219,8 +294,8 @@ async def load_locations_from_csv(file_path: str, session: AsyncSession):
                 city_id=city_id,
                 name=row.locality_name,
                 pincode=row.pincode,
-                lat=Decimal(f"{row.lat:.6f}") if pd.notnull(row.lat) else None,
-                lng=Decimal(f"{row.lng:.6f}") if pd.notnull(row.lng) else None,
+                lat=Decimal(f"{lat:.6f}") if lat is not None else None,
+                lng=Decimal(f"{lng:.6f}") if lng is not None else None,
             )
         )
 

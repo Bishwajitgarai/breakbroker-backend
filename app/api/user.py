@@ -22,7 +22,7 @@ router = APIRouter(prefix="/users", tags=["users"])
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
-async def create_user(user_in: UserCreate, db: AsyncSession = Depends(get_async_session)):
+async def create_user(user_in: UserCreate, session: AsyncSession = Depends(get_async_session)):
     redis = await get_redis()
     otp_key = f"rotp:{user_in.email}" if user_in.login_method=="email" else f"otp:{user_in.phone}"
     stored_otp = await redis.get(otp_key)
@@ -35,9 +35,9 @@ async def create_user(user_in: UserCreate, db: AsyncSession = Depends(get_async_
         )
     # Check uniqueness based on login_type
     if user_in.login_method == LoginMethod.EMAIL:
-        q = await db.execute(select(User).filter(User.email == user_in.email))
+        q = await session.execute(select(User).filter(User.email == user_in.email))
     else:  # PHONE
-        q = await db.execute(select(User).filter(User.phone == user_in.phone))
+        q = await session.execute(select(User).filter(User.phone == user_in.phone))
     
     existing_user = q.scalars().first()
     if existing_user:
@@ -63,9 +63,9 @@ async def create_user(user_in: UserCreate, db: AsyncSession = Depends(get_async_
         is_verified=False,
     )
 
-    db.add(user)
-    await db.commit()
-    await db.refresh(user)
+    session.add(user)
+    await session.commit()
+    await session.refresh(user)
     await redis.delete(otp_key)
 
     return api_response(
@@ -75,8 +75,8 @@ async def create_user(user_in: UserCreate, db: AsyncSession = Depends(get_async_
     )
 
 @router.get("/{user_id}")
-async def get_user(user_id: uuid.UUID, db: AsyncSession = Depends(get_async_session)):
-    user = await db.get(User, user_id)
+async def get_user(user_id: uuid.UUID, session: AsyncSession = Depends(get_async_session)):
+    user = await session.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -87,8 +87,8 @@ async def get_user(user_id: uuid.UUID, db: AsyncSession = Depends(get_async_sess
 
 
 @router.put("/{user_id}")
-async def update_user(user_id: uuid.UUID, user_in: UserUpdate, db: AsyncSession = Depends(get_async_session)):
-    user = await db.get(User, user_id)
+async def update_user(user_id: uuid.UUID, user_in: UserUpdate, session: AsyncSession = Depends(get_async_session)):
+    user = await session.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -100,8 +100,8 @@ async def update_user(user_id: uuid.UUID, user_in: UserUpdate, db: AsyncSession 
     for key, value in update_data.items():
         setattr(user, key, value)
 
-    await db.commit()
-    await db.refresh(user)
+    await session.commit()
+    await session.refresh(user)
 
     return api_response(
         data=UserOut.from_orm(user).dict(),
@@ -111,15 +111,15 @@ async def update_user(user_id: uuid.UUID, user_in: UserUpdate, db: AsyncSession 
 
 
 @router.delete("/{user_id}")
-async def delete_user(user_id: uuid.UUID, db: AsyncSession = Depends(get_async_session)):
-    user = await db.get(User, user_id)
+async def delete_user(user_id: uuid.UUID, session: AsyncSession = Depends(get_async_session)):
+    user = await session.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
     # Soft delete by setting is_active to False
     user.is_active = False
-    await db.commit()
-    await db.refresh(user)
+    await session.commit()
+    await session.refresh(user)
 
     return api_response(message="User deactivated successfully")
 
@@ -131,15 +131,15 @@ async def delete_user(user_id: uuid.UUID, db: AsyncSession = Depends(get_async_s
 @rate_limiter.limit("10/minute")  # example: 10 requests per minute per IP
 async def send_otp(
     request: Request, 
-    db: AsyncSession = Depends(get_async_session),
+    session: AsyncSession = Depends(get_async_session),
     method: LoginMethod = Body(...),
     contact: str = Body(...)
 ):
     # Check uniqueness based on login_type
     if method == LoginMethod.EMAIL:
-        q = await db.execute(select(User).filter(User.email == contact))
+        q = await session.execute(select(User).filter(User.email == contact))
     else:  # PHONE
-        q = await db.execute(select(User).filter(User.phone == contact))
+        q = await session.execute(select(User).filter(User.phone == contact))
     
     existing_user = q.scalars().first()
     if existing_user:

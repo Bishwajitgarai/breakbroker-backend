@@ -30,13 +30,13 @@ async def send_otp(
     request: Request, 
     method: LoginMethod = Body(...),
     contact: str = Body(...),
-    db: AsyncSession = Depends(get_async_session),
+    session: AsyncSession = Depends(get_async_session),
 ):
     # Check uniqueness based on login_type
     if method == LoginMethod.EMAIL:
-        q = await db.execute(select(User).filter(User.email == contact))
+        q = await session.execute(select(User).filter(User.email == contact))
     else:  # PHONE
-        q = await db.execute(select(User).filter(User.phone == contact))
+        q = await session.execute(select(User).filter(User.phone == contact))
     
     existing_user = q.scalars().first()
     if not existing_user:
@@ -65,7 +65,7 @@ async def send_otp(
 
 @rate_limiter.limit("10/minute")  # example: 10 requests per minute per IP
 @router.post("/verifyotp")
-async def verify_otp(request: Request,data: OTPVerifySchema, db: AsyncSession = Depends(get_async_session)):
+async def verify_otp(request: Request,data: OTPVerifySchema, session: AsyncSession = Depends(get_async_session)):
     redis = await get_redis()
     otp_key = f"otp:{data.contact}"
     stored_otp = await redis.get(otp_key)
@@ -81,28 +81,28 @@ async def verify_otp(request: Request,data: OTPVerifySchema, db: AsyncSession = 
     # Determine filter field based on login_method (optional: you could also pass login_method in schema)
     # user = None
     # if data.login_method == LoginMethod.EMAIL:
-    #     q = await db.execute(select(User).filter(User.email == data.contact))
+    #     q = await session.execute(select(User).filter(User.email == data.contact))
     #     user = q.scalars().first()
     # elif data.login_method == LoginMethod.PHONE:
-    #     q = await db.execute(select(User).filter(User.phone == data.contact))
+    #     q = await session.execute(select(User).filter(User.phone == data.contact))
     #     user = q.scalars().first()
 
     # if user and not user.is_verified:
     #     user.is_verified = True
-    #     await db.commit()
+    #     await session.commit()
     #     return api_response(message="OTP verified, user is now verified")
 
     return api_response(message="OTP verified")
 
 @rate_limiter.limit("10/minute")  # example: 10 requests per minute per IP
 @router.post("/login")
-async def login(request: Request,data: LoginSchema, db: AsyncSession = Depends(get_async_session)):
+async def login(request: Request,data: LoginSchema, session: AsyncSession = Depends(get_async_session)):
     user = None
     if data.login_method == LoginMethod.EMAIL:
-        q = await db.execute(select(User).filter(User.email == data.contact))
+        q = await session.execute(select(User).filter(User.email == data.contact))
         user = q.scalars().first()
     elif data.login_method == LoginMethod.PHONE:
-        q = await db.execute(select(User).filter(User.phone == data.contact))
+        q = await session.execute(select(User).filter(User.phone == data.contact))
         user = q.scalars().first()
 
     if not user or not verify_password(data.password, user.hashed_password):
@@ -128,7 +128,7 @@ async def login(request: Request,data: LoginSchema, db: AsyncSession = Depends(g
 
 @rate_limiter.limit("10/hour")  # example: 10 requests per minute per IP
 @router.post("/forget-password-change")
-async def password_change(request: Request,data: PasswordOTPChangeSchema, db: AsyncSession = Depends(get_async_session)):
+async def password_change(request: Request,data: PasswordOTPChangeSchema, session: AsyncSession = Depends(get_async_session)):
     redis = await get_redis()
     otp_key = f"otp:{data.contact}"
     stored_otp = await redis.get(otp_key)
@@ -142,10 +142,10 @@ async def password_change(request: Request,data: PasswordOTPChangeSchema, db: As
     await redis.delete(otp_key)
     user = None
     if data.login_method == LoginMethod.EMAIL:
-        q = await db.execute(select(User).filter(User.email == data.contact))
+        q = await session.execute(select(User).filter(User.email == data.contact))
         user = q.scalars().first()
     elif data.login_method == LoginMethod.PHONE:
-        q = await db.execute(select(User).filter(User.phone == data.contact))
+        q = await session.execute(select(User).filter(User.phone == data.contact))
         user = q.scalars().first()
 
     if not user:
@@ -156,7 +156,7 @@ async def password_change(request: Request,data: PasswordOTPChangeSchema, db: As
         )
 
     user.hashed_password = hash_password(data.new_password)
-    await db.commit()
+    await session.commit()
     return api_response(message="Password updated successfully")
 
 @rate_limiter.limit("25/hour")  # example: 10 requests per minute per IP
